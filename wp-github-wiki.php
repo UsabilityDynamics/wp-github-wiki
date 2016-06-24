@@ -44,6 +44,10 @@ namespace UsabilityDynamics\GitHubWiki {
       wp_send_json_error(array( "ok" => false, "message" => "Missing some information." ));
     }
 
+    if( !get_option( 'wp-github-wiki/access_token' ) ) {
+      wp_send_json_error(array( "ok" => false, "message" => "API not configured, missing GitHub Access Token." ));
+    }
+
     $_result = array();
 
     foreach( (array) $obj->pages as $_index => $_page ) {
@@ -97,8 +101,9 @@ namespace UsabilityDynamics\GitHubWiki {
         $_wiki[ "_id" ] = $_check[ 0 ]->ID;
       }
 
+
       $_remote_get = wp_remote_get( $_wiki[ '_url' ], array(
-        'headers' => array( 'Authorization' => 'token 50b647575ffdeb8cd4a0a44eefe5cb337e5f5643', 'cache-control' => 'no-cache' )
+        'headers' => array( 'Authorization' => 'token ' . get_option( 'wp-github-wiki/access_token' ) .  ' ', 'cache-control' => 'no-cache' )
       ) );
 
       // Could not fetch and does not exist, skip.
