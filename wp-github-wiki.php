@@ -14,8 +14,12 @@
 namespace UsabilityDynamics\GitHubWiki {
 
   // Add API endpoints.
-  add_action( 'wp_ajax_/v1/github/wiki', 'UsabilityDynamics\GitHubWiki\api_github_wiki' );
-  add_action( 'wp_ajax_nopriv_/v1/github/wiki', 'UsabilityDynamics\GitHubWiki\api_github_wiki' );
+  $_api_path = apply_filters( 'wp-github-wiki/api_path',  '/v1/github/wiki' );
+
+  if( $_api_path && $_api_path ) {
+    add_action( 'wp_ajax_' . $_api_path, 'UsabilityDynamics\GitHubWiki\api_github_wiki' );
+    add_action( 'wp_ajax_nopriv_' . $_api_path, 'UsabilityDynamics\GitHubWiki\api_github_wiki' );
+  }
 
   // Request Actions.
   add_action( 'init', 'UsabilityDynamics\GitHubWiki\Actions::init', 5 );
