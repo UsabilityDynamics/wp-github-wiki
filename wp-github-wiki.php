@@ -10,6 +10,12 @@
  *
  * Copyright 2012 - 2016 Usability Dynamics, Inc.  ( email : info@usabilitydynamics.com )
  *
+ *
+ * ### Filters
+ * 
+ * * wp-github-wiki/post_type
+ * * wp-github-wiki/api_path
+ * 
  */
 namespace UsabilityDynamics\GitHubWiki {
 
@@ -23,6 +29,7 @@ namespace UsabilityDynamics\GitHubWiki {
 
   // Request Actions.
   add_action( 'init', 'UsabilityDynamics\GitHubWiki\Actions::init', 5 );
+  add_action( 'before_delete_post', 'UsabilityDynamics\GitHubWiki\Actions::before_delete_post', 20 );
   //add_action( 'the_post', 'UsabilityDynamics\GitHubWiki\Actions::the_post', 5 );
 
   /**
@@ -32,6 +39,8 @@ namespace UsabilityDynamics\GitHubWiki {
    * WC products store their "full_name" in software_title meta key.
    *
    * wp post  list --post_type=github_wiki_doc --fields=ID --format=csv
+   *
+   * @todo Use "wiki_content_hash" meta field to identify renamed articles. Note: when an article is renamed it says "edited" in "action". If article says "edited" but not found on our system, try to match it by looking up wiki_content_hash.
    *
    * @todo Add basic authentication via AUTH_KEY constant.
    * @todo Get user_id by wiki author.
@@ -60,16 +69,22 @@ namespace UsabilityDynamics\GitHubWiki {
         "ok" => null,
         "post_id" => null,
         "terms" => null,
+        "page_name" => $_page->page_name,
+        "product" => $obj->repository->full_name
       );
 
       // For now we skip Sidebar, in future we'll use it to set order and structure.
-      if( $_page->page_name === '_Sidebar' ) {
-        $_result[$_index]["ok"] = false;
-        $_result[$_index]["message"] = "Skipping _Sidebar.";
-        continue;
+
+      // Build Wiki Object.
+      // _uid - wp-crm-wp-crm-_sidebar
+
+      if( isset( $_page->html_url ) ) {
+        $_parsed = parse_url( $_page->html_url );
+        $_url = 'https://raw.githubusercontent.com/wiki' . str_replace( '/wiki/', '/', $_parsed['path'] ) . '.md';
+      }  else {
+        $_url = 'https://raw.githubusercontent.com/wiki/' . $obj->repository->full_name . '/' . ( $_page->url_safe_file_name ? $_page->url_safe_file_name : $_page->page_name . '.md' );
       }
 
-      // Build Wiki Object
       $_wiki = array(
         "_name" => $_page->page_name,
         "_sha" => $_page->sha,
@@ -77,75 +92,118 @@ namespace UsabilityDynamics\GitHubWiki {
         "_html_url" => $_page->html_url,
         "_product" => $obj->repository->name,
         "_full_name" => $obj->repository->full_name,
-        "_url" => 'https://raw.githubusercontent.com/wiki/' . $obj->repository->full_name . '/' . $_page->page_name . '.md',
+        "_uid" => sanitize_title( str_replace( '/', '-', $obj->repository->full_name ) . '-' . $_page->page_name ),
+        "_owner" => $obj->repository->owner->login,
+        "_url" => $_url,
         "_author" => $obj->sender->login,
         "post_name" => strtolower( $_page->page_name ),
         "post_title" => $_page->title,
         "post_content" => "",
         "guid" => site_url( "/product/" . $obj->repository->name . "/docs/" . strtolower( $_page->page_name ) ),
-        // "guid" => site_url( "/docs/" . $obj->repository->name . '/'.  strtolower( $_page->page_name ) ),
         "_id" => false
       );
 
-      $_check = get_posts( array(
-        "post_type" => "github_wiki_doc",
+      // Fix stupid removed dashes.
+      $_wiki[ 'post_title' ] = str_replace( 'WP Property', 'WP-Property', $_wiki[ 'post_title' ] );
+      $_wiki[ 'post_title' ] = str_replace( 'WP CRM', 'WP-CRM', $_wiki[ 'post_title' ] );
+      $_wiki[ 'post_title' ] = str_replace( 'WP Invoice', 'WP-Invoice', $_wiki[ 'post_title' ] );
+
+      // Check for a doc with same name in the given _product taxonomy (e.g. wp-madison)
+      $_product = (array) end( get_posts( array(
+        "post_type" => "product",
         "post_status" => "any",
-        "name" => $_wiki[ 'post_name' ],
-        'tax_query' => array(
-          array(
-            'taxonomy' => "github_wiki_doc_taxonomy",
-            'field' => 'slug',
-            'terms' => array( $_wiki[ '_product' ] ),
-            'operator' => 'IN'
-          )
-        )
-      ) );
+        "meta_key" => 'software_title',
+        "meta_value" => $_wiki[ '_full_name' ]
+      ) ) );
 
-      if( is_array( $_check ) && count( $_check ) && $_check[ 0 ] && $_check[ 0 ]->ID ) {
-        $_wiki[ "_id" ] = $_check[ 0 ]->ID;
-      }
+      if( !is_array( $_product ) || !$_product ) {}
 
-
-      $_remote_get = wp_remote_get( $_wiki[ '_url' ], array(
+      $_remote_get = wp_remote_get( $_wiki[ '_url' ] . '?_cache=' . time(), array(
         'headers' => array( 'Authorization' => 'token ' . get_option( 'wp-github-wiki/access_token' ) .  ' ', 'cache-control' => 'no-cache' )
       ) );
 
       // Could not fetch and does not exist, skip.
       if( wp_remote_retrieve_response_code( $_remote_get  ) !== 200 && !$_wiki[ "_id" ] ) {
         $_result[$_index]["ok"] = false;
-        $_result[$_index]["message"] = "Could not fetch, skipping.";
+        $_result[$_index]["message"] = "Could not fetch, at [" . $_wiki[ '_url' ] . "] skipping.";
+        log( "error", "Could not fetch, at [" . $_wiki[ '_url' ] . "] skipping." );
         continue;
       }
 
       $_wiki[ 'post_content' ] = wp_remote_retrieve_body( $_remote_get );
 
+      // Check for a doc with same name in the given _product taxonomy (e.g. wp-madison)
+      $_check = get_posts( $_check_query = array(
+        "post_type" => "github_wiki_doc",
+        "post_status" => "any",
+        "meta_key" => "wiki_uid",
+        "meta_value" => $_wiki[ '_uid' ]
+      ));
+
+      if( !empty( $_check ) && isset( $_check[ 0 ] ) && isset( $_check[ 0 ]->ID ) ) {
+        log( 'info', "Wiki [" . $_page->page_name . "] found by using _uid [" . $_check[ 0 ]->ID . "] ID of the first."  );
+      } else {
+        log( 'info', "Wiki [" . $_page->page_name . "] not found by using _uid [" . $_wiki[ '_uid' ] . "]."  );
+      }
+
+      // Try to find by content sha if "created".
+      if( !$_check && $_page->action === 'edited' ) {
+
+        $_check = get_posts( $_check_query = array(
+          "post_type" => "github_wiki_doc",
+          "post_status" => "any",
+          "meta_key" => "wiki_content_hash",
+          "meta_value" => md5($_wiki[ 'post_content' ])
+        ));
+
+        if( !empty( $_check ) && isset( $_check[ 0 ] ) && isset( $_check[ 0 ]->ID ) ) {
+          log( 'info', "Wiki [" . $_page->page_name . "] not found by using _uid, performed wiki_content_hash [" . $_check_query[ 'meta_value' ] . "] and got [" . count( $_check ) . "] results with [" . ( !empty($_check) ? $_check[ 0 ]->ID : 'n/a' ). "] ID of the first. Old uid was [" . get_post_meta( $_check[ 0 ]->ID, 'wiki_uid', true ) .  "]."  );
+        } else {
+          log( 'error', "Wiki [" . $_page->page_name . "] not found by using _uid, not by wiki_content_hash [" . $_check_query[ 'meta_value' ] . "]."  );
+        }
+
+      }
+
+      if( is_array( $_check ) && count( $_check ) && $_check[ 0 ] && $_check[ 0 ]->ID ) {
+        $_wiki[ "_id" ] = $_check[ 0 ]->ID;
+      }
+
       $_insert_detail = array(
         'post_author' => isset( $user_id ) ? $user_id : 6375,
-        'post_content' => format_wiki_content( $_wiki[ 'post_content' ]   ),
+        'post_content' => null,
         'post_content_filtered' => $_wiki[ 'post_content' ],
-        'post_name' => $_wiki[ 'post_name' ],
+        'post_name' => str_replace( '%3f', '', $_wiki[ '_uid' ] ),
         'post_title' => $_wiki[ 'post_title' ],
         'post_status' => 'publish',
         'post_type' => 'github_wiki_doc',
-        'guid' => $_wiki[ 'guid' ],
+        'guid' => str_replace( '%3f', '', $_wiki[ 'guid' ] ),
         'tax_input' => array(
-          'github_wiki_doc_taxonomy' => array( $_wiki[ '_product' ] )
+          'github_wiki_doc_taxonomy' => array( $_wiki[ '_product' ] ),
+          'github_wiki_org_taxonomy' => array( $_wiki[ '_owner' ] )
         ),
         'meta_input' => array(
           // Used to find later.
-          "wiki_path" => trailingslashit( "/" . join( "/", array( "product", $_wiki[ '_product' ], "docs", $_wiki[ 'post_name' ] ) ) ),
+          "wiki_uid" => str_replace( '%3f', '', $_wiki[ '_uid' ] ),
+          "wiki_path" =>  trailingslashit( str_replace( '%3f', '', ( trailingslashit( "/" . join( "/", array( "product", $_product[ 'post_name' ], "docs", sanitize_title( $_wiki[ 'post_name' ] )  ) ) ) ) ) ),
           "wiki_sha" => $_wiki[ '_sha' ],
-          "wiki_name" => $_wiki[ '_name' ],
+          "wiki_name" => str_replace( '%3f', '', sanitize_title( $_wiki[ '_name' ] ) ),
+          "wiki_title" => $_wiki[ 'post_title' ],
+          "wiki_product_slug" => $_product[ 'post_name' ],
           "wiki_full_name" => $_wiki[ '_full_name' ],
           "wiki_product" => $_wiki[ '_product' ],
-          "wiki_url" => $_wiki[ '_url' ]
+          "wiki_product_title" => $_product['post_title'],
+          "wiki_owner" => $_wiki[ '_owner' ],
+          "wiki_url" => $_wiki[ '_url' ],
+          'wiki_file' => strtolower( $_wiki[ '_name' ] ) . '.md',
+          "wiki_type" => "content",
+          "wiki_content_hash" => md5( $_wiki[ 'post_content' ])
         ),
         //'post_parent' => 0,
         //'menu_order' => 0,
         //'context' => '',
       );
 
-      // We could not get it, trash it.
+      //die( '<pre>' . print_r( $_insert_detail, true ) . '</pre>' );
       if( wp_remote_retrieve_response_code( $_remote_get  ) !== 200 ) {
         $_insert_detail[ 'post_status' ] = "trash";
       }
@@ -155,12 +213,105 @@ namespace UsabilityDynamics\GitHubWiki {
         $_insert_detail[ 'ID' ] = $_wiki[ "_id" ];
       }
 
-      // Insert post.
-      $_result[$_index][ "post_id" ] = wp_insert_post( $_insert_detail, true );
+      // Format post_content now that we have all the post detail.
+      if( strtolower( $_page->page_name ) === '_sidebar' || strtolower( $_page->page_name ) === '_footer' ) {
 
-      // If all good, set terms.
-      if( $_result[$_index][ "post_id" ] && !is_wp_error( $_result[$_index][ "post_id" ] ) ) {
-        $_result[$_index][ "terms" ] = wp_set_object_terms( $_result[$_index][ "post_id" ], array( $_wiki[ '_product' ] ), 'github_wiki_doc_taxonomy' );
+        if( $_computed_sidebar = compute_sidebar_content($_wiki[ 'post_content' ], $_product) ) {
+          update_post_meta( $_product['ID' ], '_api_wiki_sidebar', $_computed_sidebar );
+          update_post_meta( $_product['ID' ], '_api_wiki', count( $_computed_sidebar['data'] ) );
+          log( 'info', "Added computed sidebar results to [_api_wiki_sidebar] to [" . $_product[ 'ID' ] . "] product meta with [" . count( $_computed_sidebar['data'] ) . "] items." );
+        } else {
+          delete_post_meta( $_product['ID' ], '_api_wiki_sidebar' );
+          delete_post_meta( $_product['ID' ], '_api_wiki' );
+          log( 'error', "Failed to compute sidebar for [" . $_wiki[ '_product' ] . "]." );
+        }
+
+        $_result[$_index] = array(
+          "ok" => true,
+          "message" => "Sidebar computed for [".$_wiki[ '_product' ]."] , [" .  '_api_wiki_sidebar' . $_wiki[ '_product' ].  "] updated.",
+          "items" => count( $_computed_sidebar['data'] )
+        );
+
+      } else {
+        $_insert_detail[ 'post_content' ] = format_wiki_content( $_wiki[ 'post_content' ], $_insert_detail, $_product );
+
+        // Insert post.
+        $_result[$_index][ "post_id" ] = wp_insert_post( $_insert_detail, true );
+
+        if( $_result[$_index][ "post_id" ] && !is_wp_error( $_result[$_index][ "post_id" ] )  ) {
+
+          if( $_wiki[ "_id" ] === $_result[$_index][ "post_id" ] ) {
+            log( 'info', "Wiki [" . $_page->page_name . "] updated in post_id [" . $_result[$_index][ "post_id" ] . "] with _uid of [" . $_wiki[ '_uid' ] . "]"  );
+          } else {
+            log( 'info', "Wiki [" . $_page->page_name . "] created as post_id [" . $_result[$_index][ "post_id" ] . "] with _uid of [" . $_wiki[ '_uid' ] . "]"  );
+          }
+
+          // Create UserVoice Article.
+          if( !$wiki_uservoice_id = get_post_meta( $_result[$_index][ "post_id" ], 'wiki_uservoice_id', true ) ) {
+            log( 'info', "Wiki [" . $_page->page_name . "] with post_id [" . $_result[$_index][ "post_id" ] . "] does not have a UserVoice article, creating."  );
+          } else {
+            log( 'info', "Wiki [" . $_page->page_name . "] with post_id [" . $_result[$_index][ "post_id" ] . "] already has a UserVoice article [" . $wiki_uservoice_id . "]."  );
+          }
+
+          $_body = array(
+            "id" => $wiki_uservoice_id,
+            "answer_html"=> $_insert_detail['post_content'],
+            "topic_name" => $_product[ 'post_title' ],
+            'published' => $_SERVER['GIT_BRANCH'] !== 'production' ? false : true
+          );
+
+          $add_prefix = ( strpos( strtolower( str_replace( array( ':' ), '', $_insert_detail[ 'post_title' ] ) ), strtolower( str_replace( array( ':' ), '', $_product['post_title'] ) ) ) > -1 ) ? false : true;
+
+          // Publish only if the product title exists in the article/post title.
+          if( $add_prefix  ) {
+            $_body['question'] = $_product['post_title'] . ' - ' . $_insert_detail[ 'post_title' ];
+          } else{
+            $_body['question'] = $_insert_detail[ 'post_title' ];
+          }
+
+          $_uservoice_request = wp_remote_post('https://api.usabilitydynamics.com/v1/product/update/uservoice', $_options = array(
+            'headers' => array(
+              'Content-Type' => 'application/json',
+              "x-internal-request" => "rnzlxnzawgfyncne",
+              "x-set-branch" => $_SERVER['GIT_BRANCH']
+            ),
+            'body' => json_encode($_body)
+          ) );
+
+          if( wp_remote_retrieve_response_code($_uservoice_request) === 200 ) {
+            $_response = json_decode( wp_remote_retrieve_body($_uservoice_request ) );
+
+            if( !$_response->id ) {
+              log( 'error', "Wiki [" . $_page->page_name . "] with post_id [" . $_result[$_index][ "post_id" ] . "] did not get a valid response ID from UserVoice." );
+              log( 'error', print_r( $_response, true ) );
+            } else {
+              update_post_meta( $_result[$_index][ "post_id" ], 'wiki_uservoice_id', $_response->id );
+              update_post_meta( $_result[$_index][ "post_id" ], 'wiki_uservoice_url', $_response->url );
+              update_post_meta( $_result[$_index][ "post_id" ], 'wiki_uservoice_path', $_response->path );
+              log( 'info', "Wiki [" . $_page->page_name . "] with post_id [" . $_result[$_index][ "post_id" ] . "] inserted into UserVoice wtih [wiki_uservoice_id] of [" . $_response->id . "] using title [" . $_body['question'] . "]"  );
+            }
+
+          } else {
+            log( 'error', "Wiki [" . $_page->page_name . "] with post_id [" . $_result[$_index][ "post_id" ] . "] could not be inserted into UserVoice." );
+          }
+
+          // For WooCommerce...
+          // update_post_meta( $_product['ID' ], '_api_wiki', true );
+
+          $_result[$_index][ "ok" ] = true;
+          $_result[$_index][ "permalink" ] = get_the_permalink( $_result[$_index][ "post_id" ]  );
+          $_result[$_index][ "post_title" ] = get_post_field( 'post_title',  $_result[$_index][ "post_id" ]  );
+
+          $_result[$_index][ "terms" ] = array(
+            wp_set_object_terms( $_result[$_index][ "post_id" ], array( $_wiki[ '_product' ] ), 'github_wiki_doc_taxonomy' ),
+            wp_set_object_terms( $_result[$_index][ "post_id" ], array( $_wiki[ '_owner' ] ), 'github_wiki_org_taxonomy' )
+          );
+
+        } else {
+          log( 'error', "Wiki [" . $_page->page_name . "] could NOT be inserted." );
+          log( 'error', $_result[$_index][ "post_id" ] );
+        }
+
       }
 
     }
@@ -176,16 +327,261 @@ namespace UsabilityDynamics\GitHubWiki {
    * @param $content
    * @return string
    */
-  function format_wiki_content( $content ) {
+  function format_wiki_content( $content, $_post = null, $_product = null ) {
 
     if( !file_exists( __DIR__ . '/vendor/Parsedown.php' ) ) {
       return $content;
     }
 
     require_once( __DIR__ . '/vendor/Parsedown.php' );
+
     $Parsedown = new \Parsedown();
 
-    return '<div class="wiki-content">' . $Parsedown->text($content) . '</div>';
+    $_formatted = $Parsedown->text($content);
+
+    // Replace "https://github.com/wp-property/wp-property-power-tools/wiki/Overview" with "/products/wp-property-power-tools/docs/Overview"
+    preg_match('(github\.com.+?\/wiki)', $_formatted, $matches, PREG_OFFSET_CAPTURE, 3);
+
+    foreach( $matches as $_match ) {
+
+      $_url = $_match[0];
+
+      $_parts = explode('/', $_url );
+
+      $_product_family = $_parts[1]; // e.g. "wp-property"
+      $_product_name = $_parts[2]; // e.g. "wp-property-power-tools"
+
+      $_better_url = '/product' . str_replace( 'github.com/' . $_product_family, '', $_url );
+      $_better_url = str_replace( '/wiki', '/docs', $_better_url );
+
+      $_formatted = str_replace( $_url, $_better_url, $_formatted );
+
+      // make links relative
+      $_formatted = str_replace( 'https:///', '/', $_formatted );
+
+    }
+
+    //die($_formatted);
+    return '<div class="wiki-content">' . $_formatted . '</div>';
+
+  }
+
+  /**
+   * Smart Sidebar Processing.
+   *
+   * Adds:
+   *
+   * - wiki_sidebar_title
+   * - wiki_sidebar_section
+   *
+   * @param $content
+   * @param $_post
+   * @return string
+   */
+  function compute_sidebar_content( $content, $_product = null ) {
+
+    $lines = explode("\n", $content);
+
+    $parsed = array();
+
+    $result = array();
+
+    $sections = array();
+
+    // Get the relative base_url with produc url
+    if( isset( $_product ) && $_product['ID'] ) {
+      $_permalink = get_the_permalink( $_product['ID' ] );
+      $_parsed = parse_url($_permalink );
+      $_base_url = $_parsed['path'];
+    }
+
+    foreach( $lines as $index => $line ) {
+
+      // skip the image url
+      if( strpos( $line, 'media.usabilitydynamics.com'  ) > 0 ) {
+        continue;
+      }
+
+      // Skip blank lines, but first unset the current section.
+      if( !$line || empty( $line ) ) {
+        $current_section = '';
+        continue;
+      }
+
+      // Section title.
+      if( strpos( $line, '###' ) === 0 ) {
+        $sections[] = $current_section = trim( str_replace( '###', '', $line ) );
+        $order = 0;
+        continue;
+      }
+
+      // Link line.
+      if( strpos( $line, '*' ) >= 0 ) {
+
+        preg_match_all('/\[([^\]]+)\]\(([^)"]+)(?: \"([^\"]+)\")?\)/m', $line, $matches);
+
+        if( $matches[0] ) {
+
+          $_entry = array(
+            "section" => isset( $current_section ) ? $current_section : '',
+            "raw" => end( $matches[ 0 ] ),
+            "title" => end( $matches[ 1 ] ),
+            "slug" => strtolower( end( $matches[ 2 ] ) ),
+            "wiki_path" =>  trailingslashit( ( isset( $_base_url ) ? $_base_url : '' ) . '/docs/' . str_replace( '%3f', '', strtolower( end( $matches[ 2 ] ) ) ) ),
+            "order" => isset( $order ) ? $order++ : 0,
+            "product_id" => $_product['ID' ],
+            "product_title" => get_post_meta($_product['ID'], 'software_title', true ),
+            "index" => $index
+          );
+
+          if( $_actual_wiki_page = end(get_posts( $_wiki_query = array(
+            "post_type" => "github_wiki_doc",
+            "post_status" => "publish",
+            'meta_key' => "wiki_path",
+            "meta_value" => $_entry[ 'wiki_path' ]
+          ) )) ) {
+            $_entry[ 'post_id' ] = $_actual_wiki_page->ID;
+            $_entry[ 'post_title' ] = $_actual_wiki_page->post_title;
+            update_post_meta( $_entry[ 'post_id' ], 'wiki_sidebar_title', $_entry['title'] );
+            update_post_meta( $_entry[ 'post_id' ], 'wiki_sidebar_section', $_entry['section'] );
+          }
+
+          if( !$_entry[ 'post_id' ] ) {
+            log( 'error', 'Did not find real post for [' . $_entry[ 'wiki_path' ] . '] entry ['.$_entry['raw'].'] in sidebar.' );
+            // log( 'error', $_entry );
+          }
+
+          $result[] = $_entry;
+
+          continue;
+        }
+
+      }
+
+      // if line appears ot have a link..
+      if( strpos( $line, '[[' ) ){
+
+        $raw_line = $line;
+
+        // extract just the text
+        $_title = str_replace( array( '* [[', ']]' ), '', $line  );
+
+        $_entry = array(
+          "section" => isset( $current_section ) ? $current_section : '',
+          "raw" => str_replace( '* ', '', $raw_line ),
+          "title" => $_title,
+          "slug" => sanitize_title( strtolower( $raw_line ) ),
+          "wiki_path" =>  trailingslashit(( isset( $_base_url ) ? $_base_url : '' ) . '/docs/' . str_replace( '%3f', '', sanitize_title( strtolower( $raw_line ) ) ) ),
+          "order" => isset( $order ) ? $order++ : 0,
+          "product_id" => $_product['ID' ],
+          "product_title" => get_post_meta($_product['ID'], 'software_title', true ),
+          "index" => $index
+        );
+
+        if( $_actual_wiki_page = end(get_posts( $_wiki_query = array(
+          "post_type" => "github_wiki_doc",
+          "post_status" => "publish",
+          'meta_key' => "wiki_path",
+          "meta_value" => $_entry[ 'wiki_path' ]
+        ) )) ) {
+          $_entry[ 'post_id' ] = $_actual_wiki_page->ID;
+          $_entry[ 'post_title' ] = $_actual_wiki_page->post_title;
+          update_post_meta( $_entry[ 'post_id' ], 'wiki_sidebar_title', $_entry['title'] );
+          update_post_meta( $_entry[ 'post_id' ], 'wiki_sidebar_section', $_entry['section'] );
+        }
+
+        if( !$_entry[ 'post_id' ] ) {
+          log( 'error', 'Did not find real post for [' . $_entry[ 'wiki_path' ] . '] entry ['.$_entry['raw'].'] in sidebar.' );
+          // log( 'error', $_entry );
+        }
+
+        $result[] = $_entry;
+
+      }
+
+    }
+
+    return array( "data" => $result, 'sections' => $sections, "last_update" => time() );
+
+  }
+
+	/**
+	 * Legacy/Raw Markdown Parsing.
+	 *
+	 * @param $content
+	 * @param null $_product
+	 *
+	 * @return string
+	 * @internal param $_post
+	 */
+  function format_sidebar_content( $content, $_product = null ) {
+
+    if( !file_exists( __DIR__ . '/vendor/Parsedown.php' ) ) {
+      return $content;
+    }
+
+    require_once( __DIR__ . '/vendor/Parsedown.php' );
+
+    $Parsedown = new \Parsedown();
+
+    $lines = explode("\n", $content);
+
+    $parsed = array();
+
+    // Get the relative base_url with produc url
+    if( isset( $_product ) && $_product['ID'] ) {
+      $_permalink = get_the_permalink( $_product['ID' ] );
+      $_parsed = parse_url($_permalink );
+      $_base_url = $_parsed['path'];
+    }
+
+    foreach( $lines as $line ) {
+
+      // skip the image url
+      if( strpos( $line, 'media.usabilitydynamics.com'  ) > 0 ) {
+        continue;
+      }
+
+      // if line appears ot have a link..
+      if( strpos( $line, '[[' ) ) {
+
+        // extract just the text
+        $_text = str_replace( array( '* [[', ']]' ), '', $line  );
+
+        // sanitize what we think is the url...
+        if( isset( $_base_url ) ) {
+          $line = trim($line). '(' . $_base_url . '/docs/' . sanitize_title( str_replace( ' ', '-', $_text )  ) . ')';
+        } else {
+          $line = trim($line). '(' . sanitize_title( str_replace( ' ', '-', $_text )  ) . ')';
+        }
+
+        $line = str_replace( '[[', '[', $line );
+        $line = str_replace( ']]', ']', $line );
+
+      }
+
+      $parsed[] = $line;
+    }
+
+    $_content = '' . $Parsedown->text(join("\n",$parsed)) . '';
+
+    return $_content;
+
+  }
+
+  /**
+   * Write to log.
+   *
+   * tail -F wp-content/github-wiki*
+   *
+   * @param $data
+   */
+  function log($type, $data){
+
+    //$entry = "=== " . date("F j, Y, g:i a") . " ===\n" . print_r( $data , true ) . "\n";
+    $entry = "" . date("F j, Y, g:i a") . " - " . print_r( $data , true ) . "\n";
+
+    file_put_contents('/var/www/wp-content/github-wiki.' . $type . '.log', $entry, FILE_APPEND );
 
   }
 
@@ -196,11 +592,17 @@ namespace UsabilityDynamics\GitHubWiki {
      *
      */
     static public function init() {
+      global $wp_taxonomies;
+
+      // https://usabilitydynamics.com/wp-admin/?test-wiki=sidebar
+      if( isset( $_GET['test-wiki'] ) &&  $_GET['test-wiki'] === 'sidebar' ) {
+        die(format_sidebar_content(file_get_contents('/var/www/wp-content/static/tests/fixtures/github-widebar.md'), array( "ID" => "218619" )));
+      }
 
       add_filter( 'post_link', 'UsabilityDynamics\GitHubWiki\Filters::github_wiki_doc_category_permalink', 1, 3 );
       add_filter( 'post_type_link', 'UsabilityDynamics\GitHubWiki\Filters::github_wiki_doc_category_permalink', 1, 3 );
 
-      register_post_type( 'github_wiki_doc', array(
+      $_wiki_post_type = array(
         'label' => __( 'Wiki', 'ud' ),
         'description' => __( 'Product documentation.', 'ud' ),
         'labels' => array(
@@ -231,7 +633,7 @@ namespace UsabilityDynamics\GitHubWiki {
           'filter_items_list' => __( 'Filter items list', 'ud' ),
         ),
         'supports' => array( 'title', 'page-attributes' ),
-        'taxonomies' => array( 'github_wiki_doc_taxonomy' ),
+        'taxonomies' => array( 'github_wiki_doc_taxonomy', 'github_wiki_org_taxonomy' ),
         'hierarchical' => false,
         'public' => true,
         //'query_var' => 'github_wiki_doc',
@@ -252,30 +654,32 @@ namespace UsabilityDynamics\GitHubWiki {
           'feeds' => false,
         ),
         'capability_type' => 'page',
-      ) );
+      ) ;
+      
+      register_post_type( 'github_wiki_doc', apply_filters( 'wp-github-wiki/post_type', $_wiki_post_type ) );
 
       register_taxonomy( 'github_wiki_doc_taxonomy', array( 'github_wiki_doc' ), array(
         'labels' => array(
-          'name' => _x( 'Wiki Categories', 'Taxonomy General Name', 'rdc' ),
-          'singular_name' => _x( 'Wiki Category', 'Taxonomy Singular Name', 'rdc' ),
-          'menu_name' => __( 'Products', 'rdc' ),
-          'all_items' => __( 'All Wiki Categories', 'rdc' ),
-          'parent_item' => __( 'Parent Wiki Category', 'rdc' ),
-          'parent_item_colon' => __( 'Parent Wiki Category:', 'rdc' ),
-          'new_item_name' => __( 'New Wiki Category Name', 'rdc' ),
-          'add_new_item' => __( 'Add New Wiki Category', 'rdc' ),
-          'edit_item' => __( 'Edit Wiki Category', 'rdc' ),
-          'update_item' => __( 'Update Wiki Category', 'rdc' ),
-          'view_item' => __( 'View Wiki Category', 'rdc' ),
-          'separate_items_with_commas' => __( 'Separate items with commas', 'rdc' ),
-          'add_or_remove_items' => __( 'Add or remove items', 'rdc' ),
-          'choose_from_most_used' => __( 'Choose from the most used', 'rdc' ),
-          'popular_items' => __( 'Popular Wiki Categories', 'rdc' ),
-          'search_items' => __( 'Search Wiki Categories', 'rdc' ),
-          'not_found' => __( 'Not Found', 'rdc' ),
-          'no_terms' => __( 'No items', 'rdc' ),
-          'items_list' => __( 'Wiki Categories list', 'rdc' ),
-          'items_list_navigation' => __( 'Wiki Categories list navigation', 'rdc' ),
+          'name' => _x( 'Wiki Products Categories', 'Taxonomy General Name', 'wp-github-wiki' ),
+          'singular_name' => _x( 'Wiki Products Category', 'Taxonomy Singular Name', 'wp-github-wiki' ),
+          'menu_name' => __( 'Products', 'wp-github-wiki' ),
+          'all_items' => __( 'All Wiki Categories', 'wp-github-wiki' ),
+          'parent_item' => __( 'Parent Wiki Category', 'wp-github-wiki' ),
+          'parent_item_colon' => __( 'Parent Wiki Category:', 'wp-github-wiki' ),
+          'new_item_name' => __( 'New Wiki Category Name', 'wp-github-wiki' ),
+          'add_new_item' => __( 'Add New Wiki Category', 'wp-github-wiki' ),
+          'edit_item' => __( 'Edit Wiki Category', 'wp-github-wiki' ),
+          'update_item' => __( 'Update Wiki Category', 'wp-github-wiki' ),
+          'view_item' => __( 'View Wiki Category', 'wp-github-wiki' ),
+          'separate_items_with_commas' => __( 'Separate items with commas', 'wp-github-wiki' ),
+          'add_or_remove_items' => __( 'Add or remove items', 'wp-github-wiki' ),
+          'choose_from_most_used' => __( 'Choose from the most used', 'wp-github-wiki' ),
+          'popular_items' => __( 'Popular Wiki Categories', 'wp-github-wiki' ),
+          'search_items' => __( 'Search Wiki Categories', 'wp-github-wiki' ),
+          'not_found' => __( 'Not Found', 'wp-github-wiki' ),
+          'no_terms' => __( 'No items', 'wp-github-wiki' ),
+          'items_list' => __( 'Wiki Categories list', 'wp-github-wiki' ),
+          'items_list_navigation' => __( 'Wiki Categories list navigation', 'wp-github-wiki' ),
         ),
         'hierarchical' => false,
         'public' => false,
@@ -285,13 +689,53 @@ namespace UsabilityDynamics\GitHubWiki {
           'with_front' => false,
           'hierarchical' => false
         ),
-        'show_ui' => false,
+        'show_ui' => true,
+        'show_in_menu' => true,
         'show_admin_column' => false,
         'show_in_nav_menus' => false,
         'show_tagcloud' => false,
       ) );
 
-
+      register_taxonomy( 'github_wiki_org_taxonomy', array( 'github_wiki_doc' ), array(
+        'labels' => array(
+          'name' => _x( 'Wiki Organization Categories', 'Taxonomy General Name', 'wp-github-wiki' ),
+          'singular_name' => _x( 'Wiki Organization Category', 'Taxonomy Singular Name', 'wp-github-wiki' ),
+          'menu_name' => __( 'Organizations', 'wp-github-wiki' ),
+          'all_items' => __( 'All Wiki Categories', 'wp-github-wiki' ),
+          'parent_item' => __( 'Parent Wiki Category', 'wp-github-wiki' ),
+          'parent_item_colon' => __( 'Parent Wiki Category:', 'wp-github-wiki' ),
+          'new_item_name' => __( 'New Wiki Category Name', 'wp-github-wiki' ),
+          'add_new_item' => __( 'Add New Wiki Category', 'wp-github-wiki' ),
+          'edit_item' => __( 'Edit Wiki Category', 'wp-github-wiki' ),
+          'update_item' => __( 'Update Wiki Category', 'wp-github-wiki' ),
+          'view_item' => __( 'View Wiki Category', 'wp-github-wiki' ),
+          'separate_items_with_commas' => __( 'Separate items with commas', 'wp-github-wiki' ),
+          'add_or_remove_items' => __( 'Add or remove items', 'wp-github-wiki' ),
+          'choose_from_most_used' => __( 'Choose from the most used', 'wp-github-wiki' ),
+          'popular_items' => __( 'Popular Wiki Categories', 'wp-github-wiki' ),
+          'search_items' => __( 'Search Wiki Categories', 'wp-github-wiki' ),
+          'not_found' => __( 'Not Found', 'wp-github-wiki' ),
+          'no_terms' => __( 'No items', 'wp-github-wiki' ),
+          'items_list' => __( 'Wiki Categories list', 'wp-github-wiki' ),
+          'items_list_navigation' => __( 'Wiki Categories list navigation', 'wp-github-wiki' ),
+        ),
+        'hierarchical' => false,
+        'public' => false,
+        'query_var' => 'github_wiki_org_taxonomy',
+        'rewrite' => array(
+          'slug' => 'github_wiki_org_taxonomy',
+          'with_front' => false,
+          'hierarchical' => false
+        ),
+        'show_ui' => true,
+        'show_in_menu' => true,
+        'show_admin_column' => false,
+        'show_in_nav_menus' => false,
+        'show_tagcloud' => false,
+      ) );
+      
+      
+      // die( '<pre>' . print_r( $wp_taxonomies, true ) . '</pre>' );
     }
 
     /**
@@ -304,13 +748,42 @@ namespace UsabilityDynamics\GitHubWiki {
 
       // Inject into main WC product.
       if( $_this_post->post_type === 'github_wiki_doc' ) {
-        //add_filter( 'the_content', 'UsabilityDynamics\GitHubWiki\Filters::the_content' );
         //add_filter( 'the_title', 'UsabilityDynamics\GitHubWiki\Filters::the_title' );
         //$_this_post->post_title = $_wikis_found[0]->post_title;
-        $_this_post->post_content = format_wiki_content( $_this_post->post_content );
+        $_this_post->post_content = format_wiki_content( $_this_post->post_content, $_this_post );
       }
 
-      //die( '<pre>' . print_r( $_this_post, true ) . '</pre>' );
+    }
+
+    static public function before_delete_post( $post_id ) {
+
+      $_post = get_post($post_id);
+
+      if( $_post->post_type !== 'github_wiki_doc' ) {
+        return;
+      }
+
+      // Have UserVoice aticle.
+      if( $wiki_uservoice_id = get_post_meta( $post_id, 'wiki_uservoice_id', true ) ) {
+
+        $_uservoice_request = wp_remote_request('https://api.usabilitydynamics.com/v1/product/update/uservoice/' . $wiki_uservoice_id, $_options = array(
+          'method' => 'DELETE',
+          'headers' => array(
+            'Content-Type' => 'application/json',
+            "x-internal-request" => "rnzlxnzawgfyncne",
+            "x-set-branch" => $_SERVER['GIT_BRANCH']
+          )
+        ) );
+
+        if( wp_remote_retrieve_response_code($_uservoice_request) === 200 ) {
+          $_response = json_decode( wp_remote_retrieve_body($_uservoice_request ) );
+          log( 'info', "Wiki [" . $_post->page_title . "] with post_id [" . $post_id . "] deleted from [wiki_uservoice_id] using [" . $post_id . "]."  );
+        } else {
+          log( 'error', "Wiki [" . $_post->post_title . "] with post_id [" . $_post->ID . "] could not be deleted from UserVoice." );
+        }
+
+      }
+
     }
 
   }
@@ -333,20 +806,16 @@ namespace UsabilityDynamics\GitHubWiki {
         return $permalink;
       }
 
-      $terms = wp_get_object_terms( $post->ID, 'github_wiki_doc_taxonomy', array(
-        "fields" => "names"
-      ) );
+      //$_wiki_path = get_post_meta( $post->ID, 'wiki_path', true );
+      $wiki_product_slug = get_post_meta( $post->ID, 'wiki_product_slug', true );
+      $wiki_uid  = get_post_meta( $post->ID, 'wiki_uid', true );
+      $wiki_name  = sanitize_title( get_post_meta( $post->ID, 'wiki_name', true ) );
 
-      if( !$terms || !$terms[0] ) {
-        return $permalink;
-      }
+      // replae 'wp-property-wp-property-responsive-slideshow-home" with just "home"
+      $permalink = str_replace( $wiki_uid,  $wiki_name, $permalink );
 
-      return str_replace( '%github_wiki_doc_taxonomy%', $terms[0], $permalink );
+      return str_replace( '%github_wiki_doc_taxonomy%', $wiki_product_slug, $permalink );
 
-    }
-
-    static public function the_content( $original_content ) {
-      return format_wiki_content( $original_content );
     }
 
     static public function the_title( $original_title ) {
