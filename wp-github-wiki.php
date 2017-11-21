@@ -16,6 +16,14 @@
  * * wp-github-wiki/post_type
  * * wp-github-wiki/api_path
  * 
+ * 
+ * https://api.usabilitydynamics.com/v1/product/update/github
+ * 
+ * https://www.usabilitydynamics.com/wp-admin/admin-ajax.php?action=/v1/product/update/github
+ * https://usabilitydynamics-com-andypotanin.c9users.io/wp-admin/admin-ajax.php?action=/v1/product/update/github
+ * /v1/product/update/github
+ * 
+ * 
  */
 namespace UsabilityDynamics\GitHubWiki {
 
@@ -246,15 +254,8 @@ namespace UsabilityDynamics\GitHubWiki {
             log( 'info', "Wiki [" . $_page->page_name . "] created as post_id [" . $_result[$_index][ "post_id" ] . "] with _uid of [" . $_wiki[ '_uid' ] . "]"  );
           }
 
-          // Create UserVoice Article.
-          if( !$wiki_uservoice_id = get_post_meta( $_result[$_index][ "post_id" ], 'wiki_uservoice_id', true ) ) {
-            log( 'info', "Wiki [" . $_page->page_name . "] with post_id [" . $_result[$_index][ "post_id" ] . "] does not have a UserVoice article, creating."  );
-          } else {
-            log( 'info', "Wiki [" . $_page->page_name . "] with post_id [" . $_result[$_index][ "post_id" ] . "] already has a UserVoice article [" . $wiki_uservoice_id . "]."  );
-          }
 
           $_body = array(
-            "id" => $wiki_uservoice_id,
             "answer_html"=> $_insert_detail['post_content'],
             "topic_name" => $_product[ 'post_title' ],
             'published' => $_SERVER['GIT_BRANCH'] !== 'production' ? false : true
@@ -268,35 +269,6 @@ namespace UsabilityDynamics\GitHubWiki {
           } else{
             $_body['question'] = $_insert_detail[ 'post_title' ];
           }
-
-          $_uservoice_request = wp_remote_post('https://api.usabilitydynamics.com/v1/product/update/uservoice', $_options = array(
-            'headers' => array(
-              'Content-Type' => 'application/json',
-              "x-internal-request" => "rnzlxnzawgfyncne",
-              "x-set-branch" => $_SERVER['GIT_BRANCH']
-            ),
-            'body' => json_encode($_body)
-          ) );
-
-          if( wp_remote_retrieve_response_code($_uservoice_request) === 200 ) {
-            $_response = json_decode( wp_remote_retrieve_body($_uservoice_request ) );
-
-            if( !$_response->id ) {
-              log( 'error', "Wiki [" . $_page->page_name . "] with post_id [" . $_result[$_index][ "post_id" ] . "] did not get a valid response ID from UserVoice." );
-              log( 'error', print_r( $_response, true ) );
-            } else {
-              update_post_meta( $_result[$_index][ "post_id" ], 'wiki_uservoice_id', $_response->id );
-              update_post_meta( $_result[$_index][ "post_id" ], 'wiki_uservoice_url', $_response->url );
-              update_post_meta( $_result[$_index][ "post_id" ], 'wiki_uservoice_path', $_response->path );
-              log( 'info', "Wiki [" . $_page->page_name . "] with post_id [" . $_result[$_index][ "post_id" ] . "] inserted into UserVoice wtih [wiki_uservoice_id] of [" . $_response->id . "] using title [" . $_body['question'] . "]"  );
-            }
-
-          } else {
-            log( 'error', "Wiki [" . $_page->page_name . "] with post_id [" . $_result[$_index][ "post_id" ] . "] could not be inserted into UserVoice." );
-          }
-
-          // For WooCommerce...
-          // update_post_meta( $_product['ID' ], '_api_wiki', true );
 
           $_result[$_index][ "ok" ] = true;
           $_result[$_index][ "permalink" ] = get_the_permalink( $_result[$_index][ "post_id" ]  );
@@ -418,7 +390,7 @@ namespace UsabilityDynamics\GitHubWiki {
       // Link line.
       if( strpos( $line, '*' ) >= 0 ) {
 
-        preg_match_all('/\[([^\]]+)\]\(([^)"]+)(?: \"([^\"]+)\")?\)/m', $line, $matches);
+        preg_match_all('/\[(.+?)\]\(([^"]+)(?: \"([^\"]+)\")?\)/m', $line, $matches);
 
         if( $matches[0] ) {
 
@@ -427,7 +399,7 @@ namespace UsabilityDynamics\GitHubWiki {
             "raw" => end( $matches[ 0 ] ),
             "title" => end( $matches[ 1 ] ),
             "slug" => strtolower( end( $matches[ 2 ] ) ),
-            "wiki_path" =>  trailingslashit( ( isset( $_base_url ) ? $_base_url : '' ) . '/docs/' . str_replace( '%3f', '', strtolower( end( $matches[ 2 ] ) ) ) ),
+            "wiki_path" =>  trailingslashit( ( isset( $_base_url ) ? $_base_url : '' ) . '/docs/' . str_replace( '%3f', '', sanitize_title( strtolower( end( $matches[ 2 ] ) ) ) ) ),
             "order" => isset( $order ) ? $order++ : 0,
             "product_id" => $_product['ID' ],
             "product_title" => get_post_meta($_product['ID'], 'software_title', true ),
@@ -763,26 +735,6 @@ namespace UsabilityDynamics\GitHubWiki {
         return;
       }
 
-      // Have UserVoice aticle.
-      if( $wiki_uservoice_id = get_post_meta( $post_id, 'wiki_uservoice_id', true ) ) {
-
-        $_uservoice_request = wp_remote_request('https://api.usabilitydynamics.com/v1/product/update/uservoice/' . $wiki_uservoice_id, $_options = array(
-          'method' => 'DELETE',
-          'headers' => array(
-            'Content-Type' => 'application/json',
-            "x-internal-request" => "rnzlxnzawgfyncne",
-            "x-set-branch" => $_SERVER['GIT_BRANCH']
-          )
-        ) );
-
-        if( wp_remote_retrieve_response_code($_uservoice_request) === 200 ) {
-          $_response = json_decode( wp_remote_retrieve_body($_uservoice_request ) );
-          log( 'info', "Wiki [" . $_post->page_title . "] with post_id [" . $post_id . "] deleted from [wiki_uservoice_id] using [" . $post_id . "]."  );
-        } else {
-          log( 'error', "Wiki [" . $_post->post_title . "] with post_id [" . $_post->ID . "] could not be deleted from UserVoice." );
-        }
-
-      }
 
     }
 
